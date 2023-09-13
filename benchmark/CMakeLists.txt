@@ -22,5 +22,5 @@ if(${BUILD_TPCE})
   target_link_libraries(benchmark_runner tpce)
 endif()
 
-add_executable(custom_runner custom_runner.cpp)
+add_executable(custom_runner custom_runner.cpp ../test/arrow/arrow_test_helper.cpp)
 target_link_libraries(custom_runner duckdb)

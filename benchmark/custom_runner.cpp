@@ -1,4 +1,6 @@
+#include "arrow/arrow_test_helper.hpp"
 #include "duckdb.hpp"
+#include "duckdb/main/capi/capi_internal.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "fmt/format.h"
 #include "tpch/dbgen/include/dbgen/dbgen.hpp"
@@ -80,7 +82,30 @@ void BenchmarkParquet(duckdb::Connection *con) {
 }
 
 void BenchmarkArrow(duckdb::Connection *con) {
-	// TODO
+	// None of this is documented, its just copied together from ArrowTestHelper::RunArrowComparison and adbc::Ingest
+
+	for (const auto &table : table_names) {
+		auto duckdb_rows = con->Query(duckdb_fmt::format("SELECT * FROM {}_generated", table));
+
+		// Convert duckdb rows to arrow using duckdb test helpers
+		auto client_config = duckdb::ClientConfig::GetConfig(*con->context);
+		duckdb::ArrowOptions arrow_option(con->context->db->config.options.arrow_offset_size, client_config.ExtractTimezone());
+		auto types = duckdb_rows->types;
+		auto names = duckdb_rows->names;
+
+		// TODO: Memory cleanup
+		duckdb::ArrowTestFactory* factory = new duckdb::ArrowTestFactory(std::move(types), std::move(names), std::move(duckdb_rows), true, arrow_option);
+
+		// construct the arrow scan
+		auto params = duckdb::ArrowTestHelper::ConstructArrowScan((uintptr_t)factory, true);
+		con->TableFunction("arrow_scan", params)->CreateView(table, true, true);
+	}
+
+	RunQueries(con);
+
+	for (const auto &table : table_names) {
+		con->Query(duckdb_fmt::format("DELETE VIEW {0};", table));
+	}
 }
 
 int main() {

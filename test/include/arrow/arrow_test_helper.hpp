@@ -76,11 +76,11 @@ public:
 	static bool RunArrowComparison(Connection &con, const string &query, bool big_result = false);
 	//! Used in the ADBC Testing
 	static bool RunArrowComparison(Connection &con, const string &query, ArrowArrayStream &arrow_stream);
+	static vector<Value> ConstructArrowScan(uintptr_t arrow_object, bool from_duckdb_result);
 
 private:
 	static unique_ptr<QueryResult> ScanArrowObject(Connection &con, vector<Value> &params);
 	static bool CompareResults(unique_ptr<QueryResult> arrow, unique_ptr<MaterializedQueryResult> duck,
 	                           const string &query);
-	static vector<Value> ConstructArrowScan(uintptr_t arrow_object, bool from_duckdb_result);
 };
 } // namespace duckdb
