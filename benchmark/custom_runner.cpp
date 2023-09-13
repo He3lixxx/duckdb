@@ -35,8 +35,8 @@ void MeasureAndPrintDuration(FUNC_T &&func, const std::string &step_description)
 	std::cout << "done (" << FormatDuration(time_taken) << ")" << std::endl;
 }
 
-std::vector<std::string> table_names = {"nation",   "region", "part",     "supplier", "partsupp",
-                                        "customer", "orders", "lineitem", "nation"};
+std::vector<std::string> table_names = {"nation",   "region",   "part",   "supplier",
+                                        "partsupp", "customer", "orders", "lineitem"};
 std::vector<std::string> queries(22);
 constexpr size_t ITERATIONS_PER_QUERY = 5;
 
@@ -63,7 +63,7 @@ void BenchmarkNative(duckdb::Connection *con) {
 	RunQueries(con);
 
 	for (const auto &table : table_names) {
-		con->Query(duckdb_fmt::format("DELETE VIEW {0};", table));
+		con->Query(duckdb_fmt::format("DROP VIEW {0};", table));
 	}
 }
 
@@ -81,7 +81,7 @@ void BenchmarkParquet(duckdb::Connection *con) {
 	RunQueries(con);
 
 	for (const auto &table : table_names) {
-		con->Query(duckdb_fmt::format("DELETE VIEW {0};", table));
+		con->Query(duckdb_fmt::format("DROP VIEW {0};", table));
 	}
 }
 
@@ -113,10 +113,9 @@ void BenchmarkArrow(duckdb::Connection *con) {
 	RunQueries(con);
 
 	for (const auto &table : table_names) {
-		con->Query(duckdb_fmt::format("DELETE VIEW {0};", table));
+		con->Query(duckdb_fmt::format("DROP VIEW {0};", table));
 	}
 }
-
 
 struct CustomTable {
 	duckdb::vector<duckdb::string> column_names;
@@ -126,7 +125,6 @@ struct CustomTable {
 };
 
 std::unordered_map<std::string, CustomTable> tables;
-
 
 struct CustomTableFunctionLocalState : public duckdb::LocalTableFunctionState {
 	size_t chunk_offset = 0;
@@ -141,13 +139,13 @@ CustomTableFunctionInitLocal(duckdb::ExecutionContext &context, duckdb::TableFun
 }
 
 struct CustomTableFunctionBindData : public duckdb::FunctionData {
-	CustomTable* table;
+	CustomTable *table;
 
 	duckdb::unique_ptr<FunctionData> Copy() const override {
 		throw duckdb::NotImplementedException("CustomTableFunctionBindData::Copy");
 	}
 	bool Equals(const FunctionData &other) const override {
-		if(const CustomTableFunctionBindData* other_cast = dynamic_cast<const CustomTableFunctionBindData*>(&other)) {
+		if (const CustomTableFunctionBindData *other_cast = dynamic_cast<const CustomTableFunctionBindData *>(&other)) {
 			return other_cast->table == table;
 		}
 		return false;
@@ -160,14 +158,14 @@ CustomTableFunctionBind(duckdb::ClientContext &context, duckdb::TableFunctionBin
 	auto bind_data = duckdb::make_uniq<CustomTableFunctionBindData>();
 
 	std::string requested_table_name = input.inputs[0].GetValue<std::string>();
-	CustomTable& table = tables[requested_table_name];
+	CustomTable &table = tables[requested_table_name];
 	bind_data->table = &table;
 
-	for(auto& name : table.column_names) {
+	for (auto &name : table.column_names) {
 		names.push_back(name);
 	}
 
-	for(auto& type : table.column_types) {
+	for (auto &type : table.column_types) {
 		return_types.push_back(type);
 	}
 
@@ -199,9 +197,9 @@ void BenchmarkCustomTableFunction(duckdb::Connection *con) {
 		custom_table.column_names = data->names;
 
 		// TODO: Should we use ColumnDataCollection, duckdb's wrapper around multiple data chunks?
-		while(auto result_chunk = data->Fetch()) {
+		while (auto result_chunk = data->Fetch()) {
 			custom_table.data_chunks.emplace_back(duckdb::make_uniq<duckdb::DataChunk>());
-			auto& table_chunk = custom_table.data_chunks.back();
+			auto &table_chunk = custom_table.data_chunks.back();
 
 			D_ASSERT(result_chunk->size() <= STANDARD_VECTOR_SIZE);
 			table_chunk->Initialize(*con->context, result_chunk->GetTypes());
@@ -232,11 +230,9 @@ void BenchmarkCustomTableFunction(duckdb::Connection *con) {
 
 	RunQueries(con);
 
-	con->BeginTransaction();
 	for (const auto &table : table_names) {
-		con->Query(duckdb_fmt::format("DELETE VIEW {0};", table));
+		con->Query(duckdb_fmt::format("DROP VIEW {0};", table));
 	}
-	con->Commit();
 
 	for (auto &table_name_table_pair : tables) {
 		for (auto &chunk : table_name_table_pair.second.data_chunks) {
