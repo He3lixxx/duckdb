@@ -1,6 +1,7 @@
 #include "arrow/arrow_test_helper.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "fmt/format.h"
@@ -85,6 +86,10 @@ void BenchmarkParquet(duckdb::Connection *con) {
 
 void BenchmarkArrow(duckdb::Connection *con) {
 	// None of this is documented, its just copied together from ArrowTestHelper::RunArrowComparison and adbc::Ingest
+	// Doesn't quite work currently. Error indicates that the arrow data seems to have some streaming semantics and
+	// can not be consumed multiple times
+	// Are we even sure data is read from an arrow format here? Can't really find a place in the code where it's
+	// actually materialized as arrow
 
 	for (const auto &table : table_names) {
 		auto duckdb_rows = con->Query(duckdb_fmt::format("SELECT * FROM {}_generated", table));
@@ -96,7 +101,6 @@ void BenchmarkArrow(duckdb::Connection *con) {
 		auto types = duckdb_rows->types;
 		auto names = duckdb_rows->names;
 
-		// TODO: Memory cleanup
 		duckdb::ArrowTestFactory *factory = new duckdb::ArrowTestFactory(std::move(types), std::move(names),
 		                                                                 std::move(duckdb_rows), true, arrow_option);
 
@@ -105,9 +109,6 @@ void BenchmarkArrow(duckdb::Connection *con) {
 		con->TableFunction("arrow_scan", params)->CreateView(table, true, true);
 	}
 
-	// TODO: Crashes: Probably we can't reuse the Arrow-Stream?
-	// Are we even sure data is read from an arrow format here? Can't really find a place in the code where it's
-	// actually materialized as arrow
 	RunQueries(con);
 
 	for (const auto &table : table_names) {
@@ -115,8 +116,17 @@ void BenchmarkArrow(duckdb::Connection *con) {
 	}
 }
 
-struct CustomTableFunctionInput : public duckdb::TableFunctionInput {
+duckdb::DataChunk my_custom_global_table;
+
+struct CustomTableFunctionLocalState : public duckdb::LocalTableFunctionState {
+	bool done = false;
 };
+
+static duckdb::unique_ptr<duckdb::LocalTableFunctionState> CustomTableFunctionInitLocal(duckdb::ExecutionContext& context, duckdb::TableFunctionInitInput& input, duckdb::GlobalTableFunctionState *global_state) {
+	auto state = duckdb::make_uniq<CustomTableFunctionLocalState>();
+
+	return std::move(state);
+}
 
 struct CustomTableFunctionBindData : public duckdb::FunctionData {
 	duckdb::DataChunk *table;
@@ -131,14 +141,12 @@ struct CustomTableFunctionBindData : public duckdb::FunctionData {
 	}
 };
 
-duckdb::DataChunk my_custom_global_table;
-
 static duckdb::unique_ptr<duckdb::FunctionData> CustomTableFunctionBind(duckdb::ClientContext &context,
                                                                      duckdb::TableFunctionBindInput &input,
                                                                      duckdb::vector<duckdb::LogicalType> &return_types,
                                                                      duckdb::vector<duckdb::string> &names) {
 	auto bind_data = duckdb::make_uniq<CustomTableFunctionBindData>();
-	// TODO -- irgendwie als Argument / UserData reingeben?
+	// ExTODO -- irgendwie als Argument / UserData reingeben?
 	bind_data->table = &my_custom_global_table;
 
 	// ExTODO -- multiple tables / DataChunks.
@@ -153,7 +161,14 @@ static duckdb::unique_ptr<duckdb::FunctionData> CustomTableFunctionBind(duckdb::
 static void CustomTableFunctionImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data_p,
                                     duckdb::DataChunk &output) {
 	auto &bind_data = data_p.bind_data->Cast<CustomTableFunctionBindData>();
+	auto &local_state = data_p.local_state->Cast<CustomTableFunctionLocalState>();
+
+	if(local_state.done) {
+		return;
+	}
+	
 	output.Reference(*bind_data.table);
+	local_state.done = true;
 }
 
 void BenchmarkCustomTableFunction(duckdb::Connection *con) {
@@ -163,21 +178,23 @@ void BenchmarkCustomTableFunction(duckdb::Connection *con) {
 
 	con->BeginTransaction();
 
-	// Erstmal einfachere Variante: Einfach nur zwei int-columns, mit random data
-	my_custom_global_table.Initialize(*con->context, {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT});
-
 	std::mt19937_64 rng(std::random_device {}());
+
+	// Erstmal einfachere Variante: Einfach nur zwei int-columns, mit random data
+	my_custom_global_table.Initialize(*con->context, {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT}, /*capacity=*/STANDARD_VECTOR_SIZE);
 	for (duckdb::Vector &column_data : my_custom_global_table.data) {
 		// Total wild, dass man weder den Vector noch den Chunk nach seiner size / capacity fragen kann
 		for (size_t i = 0; i < STANDARD_VECTOR_SIZE; ++i) {
 			column_data.SetValue(i, static_cast<int64_t>(rng()));
 		}
 	}
+	my_custom_global_table.SetCardinality(STANDARD_VECTOR_SIZE);
 
 	// DuckDB Table-Function registrieren.
 	duckdb::TableFunction custom_table_function(/*name=*/"custom_table_fn",
 	                                            /*arguments=*/ {duckdb::LogicalType::VARCHAR},
-	                                            /*function=*/CustomTableFunctionImpl, /*bind=*/CustomTableFunctionBind);
+	                                            /*function=*/CustomTableFunctionImpl, /*bind=*/CustomTableFunctionBind,
+												/*init_global=*/nullptr, /*init_local=*/CustomTableFunctionInitLocal);
 
 	// Copied from duckdb_register_table_function
 	auto &catalog = duckdb::Catalog::GetSystemCatalog(*con->context);
@@ -191,6 +208,7 @@ void BenchmarkCustomTableFunction(duckdb::Connection *con) {
 	}
 
 	// ExTODO: Geht Filter Pushdown? Wenn ja, wie?
+	//	- TableFunction hat wohl ein `projection_pushdown` Attribut
 
 	con->Commit();
 
@@ -199,7 +217,8 @@ void BenchmarkCustomTableFunction(duckdb::Connection *con) {
 	std::cout << "$ SELECT COUNT(*) FROM custom_table_fn('test')" << std::endl;
 	con->Query("SELECT COUNT(*) FROM custom_table_fn('test')")->Print();
 
-	con->Query("SELECT COUNT(*) FROM lineitem")->Print();
+	std::cout << "$ SELECT * FROM lineitem" << std::endl;
+	con->Query("SELECT * FROM lineitem")->Print();
 	// ExTODO: RunQueries(con);
 
 	con->BeginTransaction();
@@ -207,6 +226,8 @@ void BenchmarkCustomTableFunction(duckdb::Connection *con) {
 		con->Query(duckdb_fmt::format("DELETE VIEW {0};", table));
 	}
 	con->Commit();
+
+	my_custom_global_table.Destroy();
 }
 
 int main() {
