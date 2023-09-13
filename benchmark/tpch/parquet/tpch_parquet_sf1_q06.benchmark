@@ -1,0 +1,6 @@
+# name: benchmark/tpch/parquet/tpch_parquet_sf1_q06.benchmark
+# description: Run query 06 from the TPC-H benchmark (single-threaded), reading input data from Parquet files
+# group: [tpch-parquet]
+
+template benchmark/tpch/parquet/tpch_parquet_sf1.benchmark.in
+QUERY_NUMBER_PADDED=06

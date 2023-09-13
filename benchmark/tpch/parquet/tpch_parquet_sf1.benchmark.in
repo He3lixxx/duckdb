@@ -1,0 +1,35 @@
+# name: ${FILE_PATH}
+# description: ${DESCRIPTION}
+# group: [tpch-parquet]
+
+name Q${QUERY_NUMBER_PADDED} (Parquet)
+group tpch-parquet
+subgroup sf1
+
+require parquet
+require tpch
+
+cache tpch_parquet_sf1.duckdb
+
+load
+CALL dbgen(sf=1, suffix='_normal');
+COPY nation_normal TO '${BENCHMARK_DIR}/nation.parquet' (FORMAT PARQUET);
+COPY region_normal TO '${BENCHMARK_DIR}/region.parquet' (FORMAT PARQUET);
+COPY part_normal TO '${BENCHMARK_DIR}/part.parquet' (FORMAT PARQUET);
+COPY supplier_normal TO '${BENCHMARK_DIR}/supplier.parquet' (FORMAT PARQUET);
+COPY partsupp_normal TO '${BENCHMARK_DIR}/partsupp.parquet' (FORMAT PARQUET);
+COPY customer_normal TO '${BENCHMARK_DIR}/customer.parquet' (FORMAT PARQUET);
+COPY orders_normal TO '${BENCHMARK_DIR}/orders.parquet' (FORMAT PARQUET);
+COPY lineitem_normal TO '${BENCHMARK_DIR}/lineitem.parquet' (FORMAT PARQUET);
+CREATE VIEW nation AS SELECT * FROM read_parquet('${BENCHMARK_DIR}/nation.parquet');
+CREATE VIEW region AS SELECT * FROM read_parquet('${BENCHMARK_DIR}/region.parquet');
+CREATE VIEW part AS SELECT * FROM read_parquet('${BENCHMARK_DIR}/part.parquet');
+CREATE VIEW supplier AS SELECT * FROM read_parquet('${BENCHMARK_DIR}/supplier.parquet');
+CREATE VIEW partsupp AS SELECT * FROM read_parquet('${BENCHMARK_DIR}/partsupp.parquet');
+CREATE VIEW customer AS SELECT * FROM read_parquet('${BENCHMARK_DIR}/customer.parquet');
+CREATE VIEW orders AS SELECT * FROM read_parquet('${BENCHMARK_DIR}/orders.parquet');
+CREATE VIEW lineitem AS SELECT * FROM read_parquet('${BENCHMARK_DIR}/lineitem.parquet');
+
+run extension/tpch/dbgen/queries/q${QUERY_NUMBER_PADDED}.sql
+
+result extension/tpch/dbgen/answers/sf1/q${QUERY_NUMBER_PADDED}.csv
