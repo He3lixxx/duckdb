@@ -21,3 +21,6 @@ target_link_libraries(benchmark_runner duckdb imdb test_helpers)
 if(${BUILD_TPCE})
   target_link_libraries(benchmark_runner tpce)
 endif()
+
+add_executable(custom_runner custom_runner.cpp)
+target_link_libraries(custom_runner duckdb)
