@@ -1,6 +1,7 @@
 #include "arrow/arrow_test_helper.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/vector_size.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -116,44 +117,59 @@ void BenchmarkArrow(duckdb::Connection *con) {
 	}
 }
 
-duckdb::DataChunk my_custom_global_table;
 
-struct CustomTableFunctionLocalState : public duckdb::LocalTableFunctionState {
-	bool done = false;
+struct CustomTable {
+	duckdb::vector<duckdb::string> column_names;
+	duckdb::vector<duckdb::LogicalType> column_types;
+
+	duckdb::vector<duckdb::unique_ptr<duckdb::DataChunk>> data_chunks;
 };
 
-static duckdb::unique_ptr<duckdb::LocalTableFunctionState> CustomTableFunctionInitLocal(duckdb::ExecutionContext& context, duckdb::TableFunctionInitInput& input, duckdb::GlobalTableFunctionState *global_state) {
+std::unordered_map<std::string, CustomTable> tables;
+
+
+struct CustomTableFunctionLocalState : public duckdb::LocalTableFunctionState {
+	size_t chunk_offset = 0;
+};
+
+static duckdb::unique_ptr<duckdb::LocalTableFunctionState>
+CustomTableFunctionInitLocal(duckdb::ExecutionContext &context, duckdb::TableFunctionInitInput &input,
+                             duckdb::GlobalTableFunctionState *global_state) {
 	auto state = duckdb::make_uniq<CustomTableFunctionLocalState>();
 
 	return std::move(state);
 }
 
 struct CustomTableFunctionBindData : public duckdb::FunctionData {
-	duckdb::DataChunk *table;
+	CustomTable* table;
 
-	// Taken from
-	// https://github.com/duckdblabs/postgres_scanner/blob/cd043b49cdc9e0d3752535b8333c9433e1007a48/postgres_scanner.cpp#L62
 	duckdb::unique_ptr<FunctionData> Copy() const override {
-		throw duckdb::NotImplementedException("");
+		throw duckdb::NotImplementedException("CustomTableFunctionBindData::Copy");
 	}
 	bool Equals(const FunctionData &other) const override {
-		throw duckdb::NotImplementedException("");
+		if(const CustomTableFunctionBindData* other_cast = dynamic_cast<const CustomTableFunctionBindData*>(&other)) {
+			return other_cast->table == table;
+		}
+		return false;
 	}
 };
 
-static duckdb::unique_ptr<duckdb::FunctionData> CustomTableFunctionBind(duckdb::ClientContext &context,
-                                                                     duckdb::TableFunctionBindInput &input,
-                                                                     duckdb::vector<duckdb::LogicalType> &return_types,
-                                                                     duckdb::vector<duckdb::string> &names) {
+static duckdb::unique_ptr<duckdb::FunctionData>
+CustomTableFunctionBind(duckdb::ClientContext &context, duckdb::TableFunctionBindInput &input,
+                        duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::string> &names) {
 	auto bind_data = duckdb::make_uniq<CustomTableFunctionBindData>();
-	// ExTODO -- irgendwie als Argument / UserData reingeben?
-	bind_data->table = &my_custom_global_table;
 
-	// ExTODO -- multiple tables / DataChunks.
-	names.push_back("Meine Spalte 1");
-	names.push_back("Ein anderer Name");
-	return_types.push_back(duckdb::LogicalType::BIGINT);
-	return_types.push_back(duckdb::LogicalType::BIGINT);
+	std::string requested_table_name = input.inputs[0].GetValue<std::string>();
+	CustomTable& table = tables[requested_table_name];
+	bind_data->table = &table;
+
+	for(auto& name : table.column_names) {
+		names.push_back(name);
+	}
+
+	for(auto& type : table.column_types) {
+		return_types.push_back(type);
+	}
 
 	return std::move(bind_data);
 }
@@ -163,38 +179,41 @@ static void CustomTableFunctionImpl(duckdb::ClientContext &context, duckdb::Tabl
 	auto &bind_data = data_p.bind_data->Cast<CustomTableFunctionBindData>();
 	auto &local_state = data_p.local_state->Cast<CustomTableFunctionLocalState>();
 
-	if(local_state.done) {
+	if (local_state.chunk_offset >= bind_data.table->data_chunks.size()) {
 		return;
 	}
-	
-	output.Reference(*bind_data.table);
-	local_state.done = true;
+
+	output.Reference(*bind_data.table->data_chunks[local_state.chunk_offset++]);
 }
 
 void BenchmarkCustomTableFunction(duckdb::Connection *con) {
-	// ExTODO: Pro Table: Eine map<std::string, duckdb::DataChunk>, befüllen mit den Daten aus DuckDB `_generated`
-	// tables, columnwise In der Table-Function müssen wir dann den Vector des DataChunks so ändern, dass er unsere
-	// Daten referenziert Dann sollten wir zero-copy-scan haben
-
 	con->BeginTransaction();
 
-	std::mt19937_64 rng(std::random_device {}());
+	for (const auto &table_name : table_names) {
+		CustomTable &custom_table = tables[table_name];
 
-	// Erstmal einfachere Variante: Einfach nur zwei int-columns, mit random data
-	my_custom_global_table.Initialize(*con->context, {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT}, /*capacity=*/STANDARD_VECTOR_SIZE);
-	for (duckdb::Vector &column_data : my_custom_global_table.data) {
-		// Total wild, dass man weder den Vector noch den Chunk nach seiner size / capacity fragen kann
-		for (size_t i = 0; i < STANDARD_VECTOR_SIZE; ++i) {
-			column_data.SetValue(i, static_cast<int64_t>(rng()));
+		duckdb::unique_ptr<duckdb::MaterializedQueryResult> data =
+		    con->Query(duckdb_fmt::format("SELECT * FROM {}_generated", table_name));
+
+		custom_table.column_types = data->types;
+		custom_table.column_names = data->names;
+
+		// TODO: Should we use ColumnDataCollection, duckdb's wrapper around multiple data chunks?
+		while(auto result_chunk = data->Fetch()) {
+			custom_table.data_chunks.emplace_back(duckdb::make_uniq<duckdb::DataChunk>());
+			auto& table_chunk = custom_table.data_chunks.back();
+
+			D_ASSERT(result_chunk->size() <= STANDARD_VECTOR_SIZE);
+			table_chunk->Initialize(*con->context, result_chunk->GetTypes());
+			result_chunk->Copy(*table_chunk);
 		}
 	}
-	my_custom_global_table.SetCardinality(STANDARD_VECTOR_SIZE);
 
 	// DuckDB Table-Function registrieren.
 	duckdb::TableFunction custom_table_function(/*name=*/"custom_table_fn",
 	                                            /*arguments=*/ {duckdb::LogicalType::VARCHAR},
 	                                            /*function=*/CustomTableFunctionImpl, /*bind=*/CustomTableFunctionBind,
-												/*init_global=*/nullptr, /*init_local=*/CustomTableFunctionInitLocal);
+	                                            /*init_global=*/nullptr, /*init_local=*/CustomTableFunctionInitLocal);
 
 	// Copied from duckdb_register_table_function
 	auto &catalog = duckdb::Catalog::GetSystemCatalog(*con->context);
@@ -207,19 +226,11 @@ void BenchmarkCustomTableFunction(duckdb::Connection *con) {
 		con->TableFunction("custom_table_fn", params)->CreateView(table);
 	}
 
-	// ExTODO: Geht Filter Pushdown? Wenn ja, wie?
-	//	- TableFunction hat wohl ein `projection_pushdown` Attribut
+	// TODO: Bringt Filter Pushdown etwas? (Ansatz: TableFunction hat `filter_pushdown` Attribut)
 
 	con->Commit();
 
-	std::cout << "$ SHOW TABLES" << std::endl;
-	con->Query("SHOW TABLES")->Print();
-	std::cout << "$ SELECT COUNT(*) FROM custom_table_fn('test')" << std::endl;
-	con->Query("SELECT COUNT(*) FROM custom_table_fn('test')")->Print();
-
-	std::cout << "$ SELECT * FROM lineitem" << std::endl;
-	con->Query("SELECT * FROM lineitem")->Print();
-	// ExTODO: RunQueries(con);
+	RunQueries(con);
 
 	con->BeginTransaction();
 	for (const auto &table : table_names) {
@@ -227,7 +238,11 @@ void BenchmarkCustomTableFunction(duckdb::Connection *con) {
 	}
 	con->Commit();
 
-	my_custom_global_table.Destroy();
+	for (auto &table_name_table_pair : tables) {
+		for (auto &chunk : table_name_table_pair.second.data_chunks) {
+			chunk->Destroy();
+		}
+	}
 }
 
 int main() {
@@ -247,17 +262,18 @@ int main() {
 	scale_factor = 0.01;
 #endif
 
-	std::cout << "\n\nCustom Table Function" << std::endl;
-	BenchmarkCustomTableFunction(&con);
-	return 0; // ExTODO
-
 	std::string dbgen_query = duckdb_fmt::format("CALL dbgen(sf={}, suffix=\"_generated\")", scale_factor);
 	MeasureAndPrintDuration([&]() { con.Query(dbgen_query); }, duckdb_fmt::format("generating data ({})", dbgen_query));
 
+	std::cout << "\n\nCustom Table Function" << std::endl;
+	BenchmarkCustomTableFunction(&con);
+
 	std::cout << "\n\nNative execution (views)" << std::endl;
 	BenchmarkNative(&con);
-	std::cout << "\n\nArrow in-memory representation" << std::endl;
-	BenchmarkArrow(&con);
+
+	// std::cout << "\n\nArrow in-memory representation" << std::endl;
+	// BenchmarkArrow(&con);
+
 	std::cout << "\n\nParquet files" << std::endl;
 	BenchmarkParquet(&con);
 }
